@@ -577,3 +577,160 @@ def test_every_sections_scaling_traces(section, options):
     for name, factor in emu.scaling(LOGA_POINT).items():
         assert np.all(np.isfinite(np.asarray(factor))), (section, name)
         assert np.all(np.asarray(factor) != 0.), (section, name)
+
+
+# ── the theta basis ───────────────────────────────────────────────────────────
+#
+# `basis='theta'` replaces h with the acoustic scale, which is what a CMB box wants and the one
+# basis needing a real inverse: theta_MC_100 is not something `clone` accepts.
+
+def _theta_space(size=200, seed=42):
+    """A chain-shaped space in the physical densities, small enough to map quickly."""
+    rng = np.random.RandomState(seed)
+    return Space(samples={'omega_cdm': rng.uniform(0.115, 0.125, size),
+                          'omega_b': rng.uniform(0.0220, 0.0226, size),
+                          'h': rng.uniform(0.655, 0.695, size)})
+
+
+def _theta_emulator(**options):
+    from cosmoprimo.fiducial import DESI
+
+    return Emulator(DESI(engine='eisenstein_hu'), _theta_space(), section='background',
+                    of=('efunc', 'comoving_radial_distance'), basis='theta', **options)
+
+
+def test_theta_basis_replaces_h_and_nothing_else():
+    emulator = _theta_emulator()
+    assert 'theta_MC_100' in emulator.training.params and 'h' not in emulator.training.params
+    assert set(emulator.training.params) == {'omega_cdm', 'omega_b', 'theta_MC_100'}
+    # a reparametrisation, so the dimension is unchanged and the image is a real theta range
+    low, high = emulator.training.limits['theta_MC_100']
+    assert 1.0 < low < high < 1.1
+
+
+def test_theta_round_trip_is_exact():
+    """The same closed form in both directions, so the composition is the identity -- which is
+    what lets the formula's offset from the engine's own theta_MC_100 cancel. An inverse through
+    `Cosmology.solve` would not: the node would be fitted at one theta and recorded at another."""
+    emulator = _theta_emulator()
+    for h in (0.66, 0.68, 0.694):
+        point = {'omega_cdm': 0.12, 'omega_b': 0.0223, 'h': h}
+        back = emulator.from_training(emulator.to_training(point))
+        assert np.isclose(float(back['h']), h, rtol=0., atol=1e-9)
+        assert 'theta_MC_100' not in back
+
+
+def test_theta_basis_trains_and_predicts():
+    """End to end: the nodes are laid out in theta, evaluated by inverting to h, and a prediction
+    entered in the user's own h reproduces the cosmology it was trained on."""
+    from cosmoprimo.fiducial import DESI
+
+    emulator = _theta_emulator().train(budget=1)
+    point = {'omega_cdm': 0.121, 'omega_b': 0.0223, 'h': 0.674}
+    predicted = emulator.predict(**point)
+    exact = DESI(engine='eisenstein_hu').clone(**point).get_background()
+    z = emulator.sections['background'].z
+    for name in ('efunc', 'comoving_radial_distance'):
+        np.testing.assert_allclose(predicted[name], getattr(exact, name)(z), rtol=1e-4)
+
+
+def test_theta_basis_survives_a_write(tmp_path):
+    emulator = _theta_emulator().train(budget=1)
+    point = {'omega_cdm': 0.121, 'omega_b': 0.0223, 'h': 0.674}
+    reloaded = read(emulator.write(str(tmp_path / 'theta.h5')))
+    assert reloaded.basis == list(emulator.basis)
+    before, after = emulator.predict(**point), reloaded.predict(**point)
+    for name in before:
+        np.testing.assert_allclose(after[name], before[name], rtol=1e-12, atol=0.)
+
+
+# ── the tilt ──────────────────────────────────────────────────────────────────
+
+def _fourier_emulator(**options):
+    from cosmoprimo.fiducial import DESI
+
+    return Emulator(DESI(engine='eisenstein_hu'),
+                    Space(bounds={'omega_cdm': (0.11, 0.13), 'n_s': (0.94, 0.99),
+                                  'logA': (2.9, 3.2)}),
+                    section='fourier', k=np.geomspace(1e-3, 1., 80), z=np.array([0., 1.]),
+                    **options)
+
+
+def test_the_tilt_takes_n_s_off_the_grid():
+    """A whole dimension, not a flattening: the tilt enters a linear spectrum through the
+    primordial one alone."""
+    emulator = _fourier_emulator()
+    assert emulator.params == ['omega_cdm'] and set(emulator.exact_params) == {'n_s', 'logA'}
+    assert _fourier_emulator(tilt=False).params == ['omega_cdm', 'n_s']
+    # and it is what the node count is spent on: 3 against 5 at budget 1
+    assert len(emulator.nodes(budget=1)) < len(_fourier_emulator(tilt=False).nodes(budget=1))
+
+
+def test_the_tilt_is_exact():
+    """The ratio emulated / exact is the same number at three tilts, to machine precision."""
+    emulator = _fourier_emulator().train(budget=1)
+    ratios = [np.asarray(emulator.predict(**point)['pk.delta_m'])
+              / np.asarray(emulator.compute(point)['pk.delta_m'])
+              for point in [{'omega_cdm': 0.12, 'n_s': n_s, 'logA': 3.04}
+                            for n_s in (0.94, 0.965, 0.99)]]
+    for ratio in ratios:
+        np.testing.assert_allclose(ratio, ratios[1], rtol=0., atol=1e-12)
+
+
+def test_the_tilt_is_off_for_a_non_linear_spectrum():
+    """Halofit mixes scales, so the factorisation fails and n_s goes back on the grid."""
+    emulator = _fourier_emulator(non_linear=True)
+    assert emulator.tilt is False and 'n_s' in emulator.params
+
+
+# ── the dilation ──────────────────────────────────────────────────────────────
+
+def _dilated_emulator(**options):
+    from cosmoprimo.fiducial import DESI
+
+    return Emulator(DESI(engine='eisenstein_hu'),
+                    Space(bounds={'omega_cdm': (0.11, 0.13), 'h': (0.62, 0.72)}),
+                    section='fourier', k=np.geomspace(1e-4, 10., 400), z=np.array([0., 1.]),
+                    **options)
+
+
+def test_the_dilation_takes_h_off_a_physical_grid():
+    emulator = _dilated_emulator(dilate=True)
+    assert emulator.params == ['omega_cdm'] and 'h' in emulator.exact_params
+    assert 'h' in _dilated_emulator(dilate=False).params
+
+
+def test_the_dilation_keeps_h_on_a_grid_it_cannot_hold_fixed():
+    """The dilation holds the physical densities fixed, which a space in Omega_m does not: taking
+    h off the grid there would interpolate in Omega_m at an implied omega_cdm moving with the h
+    the dilation is meanwhile handling."""
+    from cosmoprimo.fiducial import DESI
+
+    emulator = Emulator(DESI(engine='eisenstein_hu'),
+                        Space(bounds={'Omega_m': (0.29, 0.33), 'h': (0.62, 0.72)}),
+                        section='fourier', k=np.geomspace(1e-3, 1., 60), z=np.array([0.]),
+                        dilate=True)
+    assert 'h' in emulator.params
+
+
+def test_the_dilation_reproduces_the_spectrum():
+    """Its accuracy is the resampling of its own k grid, so this is checked on a dense one."""
+    emulator = _dilated_emulator(dilate=True).train(budget=2)
+    k = emulator.sections['fourier'].k
+    inside = (k > 1e-3) & (k < 1.)
+    for h in (0.63, 0.71):
+        point = {'omega_cdm': 0.12, 'h': h}
+        ratio = (np.asarray(emulator.predict(**point)['pk.delta_m'])
+                 / np.asarray(emulator.compute(point)['pk.delta_m']))
+        assert np.max(np.abs(ratio[inside] - 1.)) < 5e-3, h
+
+
+def test_a_file_written_before_the_growth_convention_changed_is_refused():
+    """The divisor changed, so an old file would predict confidently and wrongly."""
+    from cosmoprimo.emulators.tools import StateVersionError
+
+    emulator = _fourier_emulator().train(budget=1)
+    state = emulator.__getstate__()
+    state['version'] = 1
+    with pytest.raises(StateVersionError):
+        type(emulator).from_state(state)

@@ -41,18 +41,17 @@ section). Then register it in ``_SECTIONS``. Nothing else in the package needs t
 import numpy as np
 
 from cosmoprimo.cosmology import Cosmology
-from cosmoprimo.jax import numpy_jax
+from cosmoprimo.jax import numpy as jnp, numpy_jax
 
 # aliased: in this module `Emulator` is the user-facing entry point below,
 # which dispatches on `section`; this is the template it all derives from
 from .tools import Emulator as _Emulator, NotTrained
 
 
-# Cl ~ A_s in every spelling cosmoprimo accepts; the interpolant should see only one of them.
-# Read off `Cosmology`'s own alias table rather than listed here: a spelling added there would
-# otherwise be silently missed, and this list would then take that parameter onto the grid
-# instead of scaling it -- an emulator that is quietly worse, not one that fails.
-_AMPLITUDES = ('A_s', 'logA') + tuple(Cosmology._alias_parameters['logA'])
+# the formulae divided out live in `analytic`, shared with desilike's cosmology emulators
+from .analytic import (AMPLITUDES as _AMPLITUDES, nonzero as _nonzero,
+                       eisenstein_hu_scales as _eisenstein_hu_scales, harmonic_scaling,
+                       theta_analytic, solve_theta_analytic, theta_background_kwargs, dilate)
 
 # the columns each cosmoprimo harmonic getter returns, so the scaling can be built without a run
 _SPECTRA = {'lensed_cl': ('tt', 'ee', 'bb', 'te'),
@@ -101,6 +100,18 @@ class _Table(dict):
 #: get replaced.
 PHYSICAL = ('omega_cdm', 'omega_b', 'h')
 
+#: What ``basis='theta'`` is shorthand for: the physical densities with the acoustic scale in
+#: place of :math:`h`. See :meth:`SectionEmulator.to_training`.
+THETA = ('omega_cdm', 'omega_b', 'theta_MC_100')
+
+
+def _basis(basis):
+    """``basis`` as a list of names: a shorthand resolved, anything else taken as given."""
+    if basis is None:
+        return None
+    return list({'physical': PHYSICAL, 'theta': THETA}.get(basis, basis)) \
+        if isinstance(basis, str) else list(basis)
+
 
 class SectionEmulator(_Emulator):
     r"""One section of a cosmology. Clone the fiducial, compute, extract.
@@ -114,7 +125,8 @@ class SectionEmulator(_Emulator):
     ----------
     basis : list, str, default=None
         Train in these parameters, whatever the space was written in. ``None`` trains in the
-        space's own; ``'physical'`` is shorthand for :data:`PHYSICAL`.
+        space's own; ``'physical'`` is shorthand for :data:`PHYSICAL`, ``'theta'`` for
+        :data:`THETA`.
 
         A chain may be run in :math:`\Omega_m`, but the spectra respond simply to the physical
         density :math:`\omega_{cdm} = \Omega_{cdm} h^2`, and that map mixes in :math:`h`: at fixed
@@ -128,29 +140,91 @@ class SectionEmulator(_Emulator):
         it is not the default.
 
         And it is the default for nobody, because it can also lose.
+
+        ``'theta'`` is the physical basis with :math:`100\,\theta_\mathrm{MC}` in place of
+        :math:`h`. The argument for it is that ``h``, ``w0`` and ``wa`` act on the spectra
+        almost entirely through the acoustic scale, so a box in ``h`` holds cosmologies whose
+        peaks are translated along :math:`\ell`, which is not something a low-order interpolant
+        follows.
     """
     section = None
 
     def __init__(self, cosmo, space, basis=None, **options):
         self.cosmo = cosmo
-        self.basis = None if basis is None else (
-            list(PHYSICAL) if basis == 'physical' else list(basis))
+        self.basis = _basis(basis)
         super().__init__(self.compute, space, **options)
 
     # ── the basis ─────────────────────────────────────────────────────────────
     def to_training(self, params):
-        """The user's parameters, read back in :attr:`basis` -- by the cosmology itself.
+        r"""The user's parameters, read back in :attr:`basis` -- by the cosmology itself.
 
         :meth:`~cosmoprimo.cosmology.Cosmology._get_params` does the work, because the conversion
         is a cosmology's business: it needs the parameter compilation, and the fiducial supplies
         everything the user did not vary.
+
+        ``theta_MC_100`` is the exception, and is computed by :func:`~.analytic.theta_analytic`
+        instead. Two reasons, and the second is the one that matters: deriving it the ordinary way
+        runs a background per point, and it is not an input :meth:`~cosmoprimo.cosmology.Cosmology.clone`
+        accepts, so the basis needs a genuine inverse (:meth:`from_training`) rather than another
+        call to the same converter. Using the same closed form in both directions makes the round
+        trip exact, which is what lets the formula's own ~1.6 sigma offset from the engine's
+        ``theta_MC_100`` cancel: the box is built by mapping points through this, the nodes are
+        evaluated by inverting it, and predictions enter through it again. It would only matter if
+        a ``theta`` from somewhere else -- a published box, a chain -- were fed in.
         """
         if self.basis is None:
             return params
         from cosmoprimo import Cosmology
 
-        return Cosmology._get_params(dict(params), self._basis_names(),
-                                     base=self.cosmo._input_params)
+        names = self._basis_names()
+        theta = 'theta_MC_100' in names
+        names = ['h' if name == 'theta_MC_100' else name for name in names]
+        if set(names) <= set(params):
+            # Already in the basis, so the converter is a pass-through -- measured exactly zero
+            # difference -- and skipping it is not an optimisation of the arithmetic but of the
+            # cost of getting there: `_get_params` normalises a whole parameter compilation,
+            # neutrino-mass solve included, at 12.6 ms a point. That is paid once per point of
+            # the space when `training_space` maps it, so on the default 100000 draws the
+            # difference is 21 minutes of construction against none.
+            params = {name: params[name] for name in names}
+        else:
+            params = Cosmology._get_params(dict(params), names, base=self.cosmo._input_params)
+        if theta:
+            params['theta_MC_100'] = 100. * theta_analytic(
+                params.pop('h'), params['omega_b'], params['omega_cdm'],
+                **self._theta_kwargs(params))
+        return params
+
+    def from_training(self, params):
+        """The inverse: the calculator is cloned with these, and ``theta_MC_100`` is not
+        something :meth:`~cosmoprimo.cosmology.Cosmology.clone` accepts.
+
+        ``h`` comes back through :func:`~.analytic.solve_theta_analytic`, a bisection on the same
+        closed form -- not through :meth:`~cosmoprimo.cosmology.Cosmology.solve`, which runs a
+        background per iteration and would break the exact round trip above. A bisection whose
+        bracket misses the root returns nan rather than an endpoint, so a node that cannot be
+        placed is reported instead of being fitted at the wrong theta.
+
+        Every other basis needs no inverse: its names are all ``clone`` inputs.
+        """
+        if self.basis is None or 'theta_MC_100' not in params:
+            return params
+        params = dict(params)
+        params['h'] = solve_theta_analytic(params.pop('theta_MC_100'), params['omega_b'],
+                                           params['omega_cdm'], **self._theta_kwargs(params))
+        return params
+
+    def _theta_kwargs(self, params):
+        """What :func:`~.analytic.theta_analytic` needs besides the densities: the dark energy
+        and the radiation content, varied when the space varies them and the fiducial's
+        otherwise."""
+        kwargs = {'w0': params.get('w0_fld', self.cosmo['w0_fld']),
+                  'wa': params.get('wa_fld', self.cosmo['wa_fld']),
+                  **theta_background_kwargs(params, self.cosmo)}
+        # as an array, so a compiled `theta_analytic` sees one argument structure rather than
+        # retracing between a tuple of masses and an array of them
+        kwargs['m_ncdm'] = np.atleast_1d(kwargs['m_ncdm'])
+        return kwargs
 
     #: The names a density basis stands in for. Anything else the space varies is passed
     #: through untouched.
@@ -210,6 +284,16 @@ class SectionEmulator(_Emulator):
         """
         return {}
 
+    def dilation(self, params):
+        r"""``{output name: (k grid, scale)}``: outputs read back in a reference frame before the
+        fit, at :math:`k s`, and returned to the point's own frame at prediction.
+
+        Empty by default. It is the second thing a section can know about itself, and it is not a
+        factor: :math:`h` moves a spectrum along its k axis, and no prefactor describes that. See
+        :meth:`FourierEmulator.dilation`.
+        """
+        return {}
+
     def section_class(self, source, prefix=''):
         """A :class:`~cosmoprimo.cosmology.BaseSection` serving the predictions back.
 
@@ -245,14 +329,32 @@ class SectionEmulator(_Emulator):
         return self.extract(self.clone(dict(params)))
 
     def transform(self, values, params):
-        factors = self.scaling(params)
-        return {name: value / factors[name] if name in factors else value
-                for name, value in values.items()}
+        factors, dilations = self.scaling(params), self.dilation(params)
+        out = {}
+        for name, value in values.items():
+            # the factor first, at the point's own k grid, and the dilation second: the tilt is
+            # k-dependent, so the order is part of the definition and `inverse_transform` undoes
+            # it in reverse. Dividing the tilt here, where `k h` is the live one, is what leaves
+            # the dilated spectrum's primordial factor h-free
+            if name in factors:
+                value = value / factors[name]
+            if name in dilations:
+                k, scale = dilations[name]
+                value = dilate(k, value, 1. / scale, axis=0) / scale**3
+            out[name] = value
+        return out
 
     def inverse_transform(self, values, params):
-        factors = self.scaling(params)
-        return {name: value * factors[name] if name in factors else value
-                for name, value in values.items()}
+        factors, dilations = self.scaling(params), self.dilation(params)
+        out = {}
+        for name, value in values.items():
+            if name in dilations:
+                k, scale = dilations[name]
+                value = scale**3 * dilate(k, value, scale, axis=0)
+            if name in factors:
+                value = value * factors[name]
+            out[name] = value
+        return out
 
     @property
     def sections(self):
@@ -286,22 +388,6 @@ class SectionEmulator(_Emulator):
         for name, value in state['section_options'].items():
             setattr(self, name, value)
         self.target = self.compute
-
-
-def _nonzero(values):
-    """``values`` -- an array or a scalar -- with any exact zero replaced by one.
-
-    Applied to every analytic divisor before it is handed to :meth:`~SectionEmulator.scaling`.
-    The one place it is not merely defensive is the background: the default grid ends at z = 0,
-    where ``comoving_radial_distance`` is exactly zero, and 0/0 would put a NaN straight into the
-    training data.
-
-    The substitution never shows: ``transform`` and ``inverse_transform`` both read the factors
-    from ``scaling``, so whatever is divided out is multiplied back, one for one.
-    """
-    xnp = numpy_jax(values)
-    values = xnp.asarray(values)
-    return xnp.where(values == 0., 1., values)
 
 
 def _cosmology_state(cosmo):
@@ -386,18 +472,8 @@ class HarmonicEmulator(SectionEmulator):
         Keyed by output name because the optical depth screens a different number of legs in each
         spectrum -- getting that per-leg count wrong is a silent factor of :math:`e^{\tau}`.
         """
-        amplitude = self.amplitude(params)
-        tau = params.get('tau_reio', None)
-        factors = {}
-        for name in self.of:
-            for spectrum in _SPECTRA[name]:
-                factor = 1. if amplitude is None else amplitude
-                if tau is not None:
-                    # one e^{-tau} per screened leg: 'tt' 2, 'tp' 1, 'pp' 0
-                    legs = sum(leg != 'p' for leg in spectrum)
-                    factor = factor * numpy_jax(tau).exp(-tau * legs)
-                factors[f'{name}.{spectrum}'] = factor
-        return factors
+        return harmonic_scaling([f'{name}.{spectrum}' for name in self.of for spectrum in _SPECTRA[name]],
+                                self.amplitude(params), params.get('tau_reio', None))
 
     def section_options(self):
         return {**super().section_options(), 'of': self.of, 'ellmax': self.ellmax,
@@ -561,12 +637,41 @@ class FourierEmulator(SectionEmulator):
         essentially all of the z dependence for a linear spectrum at the cost of one ODE solve
         (about 0.8 ms) per prediction. It is only a flattening for ``non_linear``, where the
         growth of the halofit correction is not the linear one.
+    dilate : bool, default=False
+        Read the spectra back in a reference frame at :math:`k s`, :math:`s = h /
+        h_\mathrm{fid}`, so that :math:`h` is carried by the dilation rather than by the
+        interpolant, and leaves the grid where the space is written in physical densities.
+
+        Off by default, because whether it wins depends on how wide the box in :math:`h` is and
+        how dense ``k`` is, and the defaults here are neither. It replaces an interpolation error
+        by a resampling one: the dilation reads the spectrum off its own k grid at shifted
+        wavenumbers, and that cubic resampling costs :math:`\mathrm{d}\ln k^4` -- 1.7e-3 on the
+        default 200-point grid, and about 1e-4 at 480 points over 2.7 decades. Measured over
+        ``h`` in [0.62, 0.72] at budget 2, worst ``|emulated / exact - 1|``: 1.7e-3 on 5 nodes
+        with it, 1.5e-4 on 13 without. It is the wide-box option -- the interpolation error it
+        removes grows with the box while the resampling error does not, and on a box three times
+        wider the same switch was worth 19x in desilike's FOLPS emulator -- so turn it on with a
+        dense ``k`` and a wide ``h``, and leave it off otherwise.
+    tilt : bool, default=True
+        Divide out :math:`(k h / k_\mathrm{pivot})^{n_s - n_s^\mathrm{fid}}`, so that
+        :math:`n_s` leaves the grid entirely.
+
+        Exact, not a flattening: the tilt enters a linear spectrum through the primordial one
+        alone, and the transfer function knows nothing of it. So this is a whole dimension off
+        the interpolation grid rather than a smaller thing to interpolate -- the same trade the
+        amplitude already gets, and for the same reason. Off for ``non_linear``, where halofit
+        mixes scales and the factorisation fails.
     """
     section = 'fourier'
+    #: 2: the analytic growth divisor changed convention (see :meth:`scaling`), so a file
+    #: written before it would predict confidently and wrongly rather than fail.
+    version = 2
 
     def __init__(self, cosmo, space, k=None, z=None, of=('delta_m',), non_linear=False,
-                 analytic=True, **options):
+                 analytic=True, tilt=True, dilate=False, **options):
         self.analytic = bool(analytic)
+        self.tilt = bool(tilt) and not non_linear
+        self.dilate = bool(dilate) and not non_linear
         self.k = np.asarray(k, dtype='f8') if k is not None else np.logspace(-4., 1., 200)
         self.z = np.asarray(z, dtype='f8') if z is not None else np.linspace(0., 10.**0.5, 30)**2
         self.of = (of,) if isinstance(of, str) else tuple(of)
@@ -577,32 +682,84 @@ class FourierEmulator(SectionEmulator):
         fourier = cosmo.get_fourier()
         values = {}
         for name in self.of:
-            interpolator = fourier.pk_interpolator(of=name, non_linear=self.non_linear)
+            # passed only when asked for: `non_linear=False` is every engine's default, and the
+            # ones that cannot do halofit at all (eisenstein_hu) reject the keyword outright
+            # rather than ignore it, so naming it made them unemulatable
+            interpolator = fourier.pk_interpolator(of=name,
+                                                   **({'non_linear': True} if self.non_linear else {}))
             values[f'pk.{name}'] = np.asarray(interpolator(self.k, self.z), dtype='f8')
         return values
 
     def select_params(self, names):
-        # P(k) is exactly linear in A_s -- but halofit is not, so the amplitude only leaves the
-        # grid for the linear spectrum
+        # P(k) is exactly linear in A_s and an exact power law in n_s -- but halofit is neither,
+        # so they only leave the grid for the linear spectrum
         if self.non_linear:
             return list(names)
-        return [name for name in names if name not in _AMPLITUDES]
+        exact = _AMPLITUDES + (('n_s',) if self.tilt else ())
+        # `h` only where the rest of the space is h-free: the dilation holds the physical
+        # densities fixed, and a space written in `Omega_m` does not -- taking `h` off the grid
+        # there would interpolate in `Omega_m` at an implied `omega_cdm` that moves with the `h`
+        # the dilation is meanwhile handling
+        if self.dilate and not any(name in names for name in ('Omega_m', 'Omega_cdm', 'Omega_b',
+                                                              'omega_m')):
+            exact = exact + ('h', 'H0')
+        return [name for name in names if name not in exact]
 
     def scaling(self, params):
         amplitude = self.amplitude(params)
         factor = 1. if amplitude is None else amplitude
+        if self.tilt:
+            # `k` is in h/Mpc and `k_pivot` in 1/Mpc, so the tilt is a power of `k h`: measured,
+            # cosmoprimo's primordial spectrum is h^3 A_s (k h / k_pivot)^(n_s - 1) read on a
+            # grid in h/Mpc. Anchored at the fiducial's n_s so the factor is 1 there.
+            #
+            # `h` is read back through `from_training` because a basis may have replaced it --
+            # in the theta basis it is not among the training parameters at all.
+            user = self.from_training(dict(params))
+            n_s, h = (user.get(name, self.cosmo[name]) for name in ('n_s', 'h'))
+            tilt = (self.k * h / self.cosmo['k_pivot']) ** (n_s - self.cosmo['n_s'])
+            # pk arrays are (k, z); the tilt varies along the first axis
+            factor = factor * np.asarray(tilt, dtype='f8')[:, None]
         if self.analytic:
-            growth = np.asarray(self.analytic_background(params).growth_factor(self.z),
+            # znorm=0, the convention the engines' own spectra carry (D ~ a in matter
+            # domination), not the default normalisation to 1 at z = 0. The default divides out
+            # only the relative growth: being 1 at z = 0 for every cosmology by construction, it
+            # leaves the absolute normalisation, and that is a real cosmology dependence -- it
+            # moves with h at fixed physical densities, since Omega_m = omega_m / h^2 does, and
+            # desilike measured the same leftover at 12% across a (w0, wa) box against ~1e-3
+            # once the absolute growth is taken out.
+            #
+            # With h on the grid the interpolant absorbs it either way (measured: 1.65e-3
+            # against 1.61e-3), which is why this went unnoticed. It is fatal once `dilate`
+            # takes h off the grid: 6.5% over h in [0.63, 0.71], against 2.2e-3 with znorm=0.
+            growth = np.asarray(self.analytic_background(params).growth_factor(self.z, znorm=0.),
                                 dtype='f8')
-            # pk arrays are (k, z); the growth varies along the last axis
+            # ... and the growth along the last
             factor = factor * _nonzero(growth**2)[None, :]
-        elif amplitude is None:
+        elif amplitude is None and not self.tilt:
             return {}
         return {f'pk.{name}': factor for name in self.of}
 
+    def dilation(self, params):
+        r"""``{output: (k, s)}`` with :math:`s = h / h_\mathrm{fid}`.
+
+        At fixed physical densities the transfer function in :math:`\mathrm{Mpc}^{-1}` does not
+        move with :math:`h`, so a spectrum in :math:`(\mathrm{Mpc}/h)^3` on a grid in
+        :math:`h/\mathrm{Mpc}` is :math:`P_h(k) = s^3 P_\mathrm{fid}(k s)` -- exactly, but for
+        the late-time growth, which :attr:`analytic` divides out separately. What is left for the
+        interpolant is a reference-frame spectrum plus a smooth residual, instead of the BAO
+        wiggles sliding through the k grid, which no low-order polynomial follows.
+        """
+        if not self.dilate:
+            return {}
+        user = self.from_training(dict(params))
+        scale = user.get('h', self.cosmo['h']) / self.cosmo['h']
+        return {f'pk.{name}': (self.k, scale) for name in self.of}
+
     def section_options(self):
         return {**super().section_options(), 'k': self.k, 'z': self.z, 'of': self.of,
-                'non_linear': self.non_linear, 'analytic': self.analytic}
+                'non_linear': self.non_linear, 'analytic': self.analytic, 'tilt': self.tilt,
+                'dilate': self.dilate}
 
     def section_class(self, source, prefix=''):
         from cosmoprimo.cosmology import BaseSection
@@ -648,29 +805,6 @@ class FourierEmulator(SectionEmulator):
 # ── thermodynamics ────────────────────────────────────────────────────────────
 
 _THERMODYNAMICS = ('rs_drag', 'z_drag', 'rs_star', 'z_star', 'theta_star', 'theta_cosmomc')
-
-
-def _eisenstein_hu_scales(cosmo):
-    r"""The Eisenstein & Hu (1998) fitting formulae for :math:`z_\mathrm{drag}` and
-    :math:`r_s(z_\mathrm{drag})`, in Mpc/h.
-
-    Transcribed from ``EisensteinHuEngine._set_rsdrag`` rather than called through it, because
-    that engine refuses massive neutrinos, curvature and dark energy. A preconditioner does not have
-    to be correct physics, only a smooth function of the same parameters with roughly the right magnitude;
-    what it gets wrong stays on the grid and is interpolated as before.
-    """
-    omega_m, omega_b = cosmo['omega_m'], cosmo['omega_b']
-    theta_cmb = cosmo['T_cmb'] / 2.7
-    z_eq = 2.5e4 * omega_m * theta_cmb**(-4) - 1.
-    k_eq = 0.0746 * omega_m * theta_cmb**(-2)
-    b1 = 0.313 * omega_m**(-0.419) * (1. + 0.607 * omega_m**0.674)
-    b2 = 0.238 * omega_m**0.223
-    z_drag = 1345. * omega_m**0.251 / (1. + 0.659 * omega_m**0.828) * (1. + b1 * omega_b**b2)
-    r_drag = 31.5 * omega_b * theta_cmb**(-4) * (1000. / (1. + z_drag))
-    r_eq = 31.5 * omega_b * theta_cmb**(-4) * (1000. / (1. + z_eq))
-    rs_drag = 2. / (3. * k_eq) * np.sqrt(6. / r_eq) * np.log(
-        (np.sqrt(1. + r_drag) + np.sqrt(r_drag + r_eq)) / (1. + np.sqrt(r_eq)))
-    return {'z_drag': float(z_drag), 'rs_drag': float(rs_drag * cosmo['h'])}
 
 
 class ThermodynamicsEmulator(SectionEmulator):
@@ -767,17 +901,20 @@ class CosmologyEmulator(_Emulator):
     they share the node set.
     """
     section = None
+    #: 2: a composite may hold a fourier section, whose divisor changed convention.
+    version = 2
 
     def __init__(self, cosmo, space, sections, basis=None, **options):
         self.cosmo = cosmo
-        self.basis = None if basis is None else (
-            list(PHYSICAL) if basis == 'physical' else list(basis))
+        self.basis = _basis(basis)
         # the sections share the node set, so they share the basis too
         self.sections = {name: _SECTIONS[name](cosmo, space, basis=basis, **dict(kwargs))
                          for name, kwargs in sections.items()}
         super().__init__(self.compute, space, **options)
 
     to_training = SectionEmulator.to_training
+    from_training = SectionEmulator.from_training
+    _theta_kwargs = SectionEmulator._theta_kwargs
     _basis_names = SectionEmulator._basis_names
     training_space = SectionEmulator.training_space
 

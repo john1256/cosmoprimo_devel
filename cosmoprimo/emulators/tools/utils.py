@@ -272,7 +272,21 @@ def _sqrt_forward(x):
 # Named expansion-variable transforms: name -> (forward, inverse), forward monotone
 # increasing. With a transform, step sizes / anchors / collocation ranges are in
 # transformed units, and derivatives are w.r.t. the transformed variable.
-TRANSFORMS = {'sqrt': (_sqrt_forward, lambda u: u * u)}
+def _log_forward(x):
+    xnp = numpy_jax(x)
+    return xnp.log(x)
+
+
+def _log_inverse(u):
+    xnp = numpy_jax(u)
+    return xnp.exp(u)
+
+
+#: Named expansion-variable transforms. ``'log'`` is the natural variable for a strictly positive
+#: quantity -- a density fraction, a mass -- and it does for zero what ``'logit_w0pwa'`` does for
+#: the dark-energy bound: makes it unreachable rather than an edge a node set has to be cut back
+#: from.
+TRANSFORMS = {'sqrt': (_sqrt_forward, lambda u: u * u), 'log': (_log_forward, _log_inverse)}
 
 
 def nested_level_nodes(level, limits=(-1., 1.)):
